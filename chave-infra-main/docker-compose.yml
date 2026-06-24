@@ -1,0 +1,142 @@
+services:
+  # ── Ministack (LocalStack) ──────────────────────────────────────────────────
+  ministack:
+    image: ministackorg/ministack
+    container_name: ministack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,rds,apigateway,sts
+      - DEBUG=0
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - ministack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4566/_localstack/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ── MS Auth ─────────────────────────────────────────────────────────────────
+  # O banco do auth é o RDS do LocalStack (provisionado pelo Makefile via Terraform)
+  chave-ms-auth:
+    build:
+      context: ../chave-ms-auth
+      dockerfile: Dockerfile
+    container_name: chave-ms-auth
+    ports:
+      - "${MS_AUTH_PORT:-3001}:3001"
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - JWT_SECRET=${JWT_SECRET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - AWS_ENDPOINT=http://ministack:4566
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+    depends_on:
+      ministack:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── MFE Auth ────────────────────────────────────────────────────────────────
+  chave-mfe-auth:
+    build:
+      context: ../chave-mfe-auth
+      dockerfile: Dockerfile
+    container_name: chave-mfe-auth
+    ports:
+      - "${MFE_AUTH_PORT:-4001}:4001"
+    environment:
+      - VITE_MS_AUTH_URL=http://localhost:3001
+    restart: unless-stopped
+
+  # ── Report DB ───────────────────────────────────────────────────────────────
+  # Banco exclusivo do report-service — totalmente separado do auth RDS
+  report-db:
+    image: postgres:16
+    container_name: report-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: report_service
+    ports:
+      - "5433:5432"
+    volumes:
+      - report_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Report Service ──────────────────────────────────────────────────────────
+  report-service:
+    build:
+      context: ../report-service
+      dockerfile: Dockerfile
+    container_name: report-service
+    ports:
+      - "3005:3005"
+    environment:
+      PORT: 3005
+      DB_HOST: report-db
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: report_service
+      JWT_SECRET: ${JWT_SECRET}
+      ASSESSMENT_SERVICE_URL: http://assessment-service:3002/api/v1
+      COMPETENCY_SERVICE_URL: http://competency-service:3003/api/v1
+      USER_GROUP_SERVICE_URL: http://user-group-service:3004/api/v1
+      REPORT_EXPIRY_DAYS: 30
+    depends_on:
+      report-db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3005/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Report MFE ──────────────────────────────────────────────────────────────
+  report-mfe:
+    build:
+      context: ../report-mfe
+      dockerfile: Dockerfile
+      args:
+        VITE_REPORT_SERVICE_URL: http://localhost:3005/api/v1
+    container_name: report-mfe
+    ports:
+      - "3105:3105"
+    depends_on:
+      - report-service
+    restart: unless-stopped
+
+  # ── Shell ───────────────────────────────────────────────────────────────────
+  chave-shell:
+    build:
+      context: ../chave-shell
+      dockerfile: Dockerfile
+    container_name: chave-shell
+    ports:
+      - "${SHELL_PORT:-3000}:3000"
+    depends_on:
+      - chave-mfe-auth
+      - report-mfe
+    restart: unless-stopped
+
+volumes:
+  ministack_data:
+  report_db_data:
